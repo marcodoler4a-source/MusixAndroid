@@ -5,6 +5,11 @@ import android.content.ContentUris
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.media.MediaMetadataRetriever
+import android.net.Uri
+import android.provider.OpenableColumns
+import java.io.File
+import java.util.UUID
 import android.provider.MediaStore
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -49,6 +54,7 @@ class MainActivity : ComponentActivity() {
     private var progress by mutableLongStateOf(0L)
     private var total by mutableLongStateOf(0L)
     private var libraryVersion by mutableIntStateOf(0)
+    private var importMessage by mutableStateOf<String?>(null)
     private var controllerFuture: com.google.common.util.concurrent.ListenableFuture<MediaController>? = null
     private val listener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) { playing = isPlaying }
@@ -75,24 +81,71 @@ class MainActivity : ComponentActivity() {
             val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
             var granted by remember { mutableStateOf(ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED) }
             val request = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> granted = ok; if (ok) libraryVersion++ }
-            LaunchedEffect(granted, libraryVersion) { if (granted) songs = loadSongs() }
+            val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+                if (uris.isNotEmpty()) {
+                    val imported = importFiles(uris)
+                    importMessage = if (imported > 0) "Imported $imported song${if (imported == 1) "" else "s"}" else "No audio files could be imported"
+                    libraryVersion++
+                }
+            }
+            LaunchedEffect(granted, libraryVersion) { songs = loadSongs(granted) }
             LaunchedEffect(controller) {
                 while (true) { progress = controller?.currentPosition?.coerceAtLeast(0L) ?: 0L; total = controller?.duration?.coerceAtLeast(0L) ?: 0L; delay(500) }
             }
-            MusixScreen(songs, granted, { request.launch(permission) }, { libraryVersion++ }, controller, currentId, playing, progress, total, ::playSong)
+            MusixScreen(songs, granted, { request.launch(permission) }, { libraryVersion++ },
+                { importLauncher.launch(arrayOf("audio/*")) }, importMessage, { importMessage = null },
+                controller, currentId, playing, progress, total, ::playSong)
         }
     }
-    private fun loadSongs(): List<Song> {
+    private fun importFiles(uris: List<Uri>): Int {
+        val folder = File(filesDir, "imported_music").apply { mkdirs() }
+        var count = 0
+        for (uri in uris) {
+            try {
+                val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getString(0) else null
+                } ?: "Audio"
+                val extension = name.substringAfterLast('.', "mp3").lowercase().takeIf { it in setOf("mp3", "m4a", "flac", "wav", "ogg", "opus", "aac") } ?: "mp3"
+                val destination = File(folder, "${UUID.randomUUID()}.$extension")
+                contentResolver.openInputStream(uri)?.use { input -> destination.outputStream().use { input.copyTo(it) } }
+                    ?: continue
+                if (destination.length() == 0L) { destination.delete(); continue }
+                // Store the original display name alongside the copied audio.
+                File(folder, "${destination.name}.title").writeText(name.substringBeforeLast('.', name))
+                count++
+            } catch (_: Exception) { /* Skip files that cannot be opened. */ }
+        }
+        return count
+    }
+    private fun importedSongs(): List<Song> {
+        val folder = File(filesDir, "imported_music")
+        return folder.listFiles()?.filter { it.isFile && it.extension.lowercase() in setOf("mp3", "m4a", "flac", "wav", "ogg", "opus", "aac") }?.map { file ->
+            var title = File(folder, "${file.name}.title").takeIf { it.exists() }?.readText() ?: file.nameWithoutExtension
+            var artist = "Unknown artist"
+            var album = "Imported music"
+            var duration = 0L
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(file.absolutePath)
+                title = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_TITLE)?.takeIf { it.isNotBlank() } ?: title
+                artist = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: artist
+                album = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ALBUM) ?: album
+                duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            } catch (_: Exception) { } finally { try { retriever.release() } catch (_: Exception) { } }
+            Song(-file.nameWithoutExtension.hashCode().toLong().let { if (it < 0) -it else it } - 1L, title, artist, album, duration, Uri.fromFile(file))
+        } ?: emptyList()
+    }
+    private fun loadSongs(hasPermission: Boolean): List<Song> {
         val result = mutableListOf<Song>()
         val collection = if (Build.VERSION.SDK_INT >= 29) MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL) else MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
         val columns = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.DURATION)
-        contentResolver.query(collection, columns, "${MediaStore.Audio.Media.IS_MUSIC} != 0", null, "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC")?.use { cursor ->
+        if (hasPermission) contentResolver.query(collection, columns, "${MediaStore.Audio.Media.IS_MUSIC} != 0", null, "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC")?.use { cursor ->
             while (cursor.moveToNext()) {
                 val id = cursor.getLong(0)
                 result += Song(id, cursor.getString(1) ?: "Unknown title", cursor.getString(2) ?: "Unknown artist", cursor.getString(3) ?: "Unknown album", cursor.getLong(4), ContentUris.withAppendedId(collection, id))
             }
         }
-        return result
+        return (result + importedSongs()).distinctBy { it.uri }.sortedBy { it.title.lowercase() }
     }
     private fun playSong(song: Song, queue: List<Song>) {
         controller?.let { c ->
@@ -112,7 +165,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-private fun MusixScreen(songs: List<Song>, granted: Boolean, request: () -> Unit, refresh: () -> Unit, player: MediaController?, currentId: Long, playing: Boolean, progress: Long, total: Long, play: (Song, List<Song>) -> Unit) {
+private fun MusixScreen(songs: List<Song>, granted: Boolean, request: () -> Unit, refresh: () -> Unit, importMusic: () -> Unit, importMessage: String?, dismissMessage: () -> Unit, player: MediaController?, currentId: Long, playing: Boolean, progress: Long, total: Long, play: (Song, List<Song>) -> Unit) {
     var tab by remember { mutableStateOf("Songs") }
     var search by remember { mutableStateOf("") }
     var nowPlaying by remember { mutableStateOf(false) }
@@ -129,14 +182,22 @@ private fun MusixScreen(songs: List<Song>, granted: Boolean, request: () -> Unit
                 Icon(Icons.Default.MusicNote, null, tint = blue, modifier = Modifier.size(30.dp))
                 Spacer(Modifier.width(10.dp))
                 Text("Musix", fontSize = 29.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                IconButton(onClick = importMusic) { Icon(Icons.Default.LibraryAdd, "Import music") }
                 IconButton(onClick = refresh) { Icon(Icons.Default.Refresh, "Refresh library") }
             }
-            if (!granted) {
+            if (importMessage != null) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(importMessage, modifier = Modifier.weight(1f), color = blue)
+                    TextButton(onClick = dismissMessage) { Text("OK") }
+                }
+            }
+            if (!granted && songs.isEmpty()) {
                 Column(Modifier.fillMaxWidth().weight(1f).padding(30.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
                     Icon(Icons.Default.LibraryMusic, null, tint = blue, modifier = Modifier.size(70.dp))
                     Spacer(Modifier.height(20.dp)); Text("Your music, beautifully organized", fontSize = 22.sp)
                     Spacer(Modifier.height(12.dp)); Text("Allow audio access to browse music stored on this Android device.")
-                    Spacer(Modifier.height(24.dp)); Button(onClick = request) { Text("Allow Music Access") }
+                    Spacer(Modifier.height(24.dp)); Button(onClick = importMusic) { Text("Import Music") }
+                    Spacer(Modifier.height(8.dp)); TextButton(onClick = request) { Text("Allow Music Access for Automatic Scanning") }
                 }
             } else if (nowPlaying) {
                 Column(Modifier.weight(1f).fillMaxWidth().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
@@ -177,7 +238,16 @@ private fun MusixScreen(songs: List<Song>, granted: Boolean, request: () -> Unit
                     var expanded by remember { mutableStateOf(false) }
                     Box { TextButton(onClick = { expanded = true }) { Text("Sort: $sort") }; DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) { listOf("Title", "Artist", "Album", "Longest").forEach { choice -> DropdownMenuItem(text = { Text(choice) }, onClick = { sort = choice; expanded = false }) } } }
                 }
-                LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 8.dp)) {
+                if (songs.isEmpty()) {
+                    Column(Modifier.fillMaxWidth().weight(1f).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                        Icon(Icons.Default.LibraryMusic, null, tint = blue, modifier = Modifier.size(64.dp))
+                        Spacer(Modifier.height(12.dp))
+                        Text("No music yet", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                        Text("Choose audio files to add them to your library", color = Color.LightGray)
+                        Spacer(Modifier.height(16.dp))
+                        Button(onClick = importMusic) { Icon(Icons.Default.LibraryAdd, null); Spacer(Modifier.width(8.dp)); Text("Import Music") }
+                    }
+                } else LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 8.dp)) {
                     when (tab) {
                         "Songs" -> items(filtered, key = { it.id }) { song -> SongRow(song, { play(song, filtered) }) }
                         "Albums" -> items(filtered.groupBy { it.album }.toList().sortedBy { it.first }) { (album, tracks) -> GroupRow(album, "${tracks.size} tracks", { play(tracks.first(), tracks) }) }
